@@ -32,7 +32,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-ADMIN_IDS = {5230838728}
+ADMIN_IDS = {5230838728, 960427611}
 # Set to None to allow everyone to browse, or use e.g. {123456789, 987654321}.
 ALLOWED_IDS: Optional[set[int]] = None
 
