@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import psycopg
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -523,6 +523,12 @@ async def error_handler(
     )
 
 
+async def set_bot_commands(application: Application) -> None:
+    await application.bot.set_my_commands(
+        [BotCommand("start", "Browse the Excel archive")]
+    )
+
+
 def main() -> None:
     if not TOKEN:
         raise RuntimeError(
@@ -539,7 +545,12 @@ def main() -> None:
             "hyphens when using RENDER_EXTERNAL_URL."
         )
     initialize_database()
-    application = Application.builder().token(TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(set_bot_commands)
+        .build()
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("delete", delete_command))
     application.add_handler(CommandHandler("list", list_command))
