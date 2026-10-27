@@ -1,7 +1,7 @@
 """
 Telegram bot for indexing and browsing an Excel-file archive.
 
-Install with: pip install "python-telegram-bot>=20,<23"
+Install with: pip install -r requirements.txt
 """
 
 from __future__ import annotations
@@ -10,9 +10,11 @@ import logging
 import re
 import os
 import sqlite3
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+import psycopg
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -27,12 +29,16 @@ from telegram.ext import (
 
 # Bot configuration: replace TOKEN and add the numeric Telegram user IDs.
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 ADMIN_IDS = {5230838728}
 # Set to None to allow everyone to browse, or use e.g. {123456789, 987654321}.
 ALLOWED_IDS: Optional[set[int]] = None
 
 # Storage and labels.
 DATABASE_PATH = Path(__file__).with_name("excel_archive.db")
+WEBHOOK_PATH = "telegram-webhook"
 SEASONS = ("spring", "summer", "autumn", "winter", "bts")
 CATEGORIES = ("kvi", "discount", "best sell")
 CATEGORY_CALLBACKS = {"kvi": "kvi", "discount": "discount", "best sell": "best_sell"}
@@ -54,128 +60,151 @@ USAGE = (
 )
 
 
-# Database helpers. Each operation owns and closes its SQLite connection.
+# Database helpers. Each operation owns and closes its PostgreSQL connection.
+def _database_connection() -> psycopg.Connection[tuple[Any, ...]]:
+    if not DATABASE_URL:
+        raise RuntimeError("Set DATABASE_URL to your PostgreSQL connection string.")
+    return psycopg.connect(DATABASE_URL, connect_timeout=10)
+
+
 def initialize_database() -> None:
     """Create the archive table automatically on the first run."""
-    connection = sqlite3.connect(DATABASE_PATH)
-    try:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS files (
-                year TEXT NOT NULL,
-                season TEXT NOT NULL,
-                category TEXT NOT NULL,
-                file_id TEXT NOT NULL,
-                file_name TEXT NOT NULL,
-                PRIMARY KEY (year, season, category)
+    with _database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS files (
+                    year TEXT NOT NULL,
+                    season TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    PRIMARY KEY (year, season, category)
+                )
+                """
             )
+
+
+def migrate_sqlite_to_postgres() -> int:
+    """Copy the local SQLite archive to PostgreSQL without deleting the source."""
+    if not DATABASE_PATH.is_file():
+        raise FileNotFoundError(f"SQLite archive not found: {DATABASE_PATH}")
+
+    initialize_database()
+    sqlite_connection = sqlite3.connect(DATABASE_PATH)
+    try:
+        rows = sqlite_connection.execute(
             """
-        )
-        connection.commit()
+            SELECT year, season, category, file_id, file_name
+            FROM files
+            """
+        ).fetchall()
     finally:
-        connection.close()
+        sqlite_connection.close()
+
+    if not rows:
+        logger.info("The local SQLite archive contains no entries to migrate")
+        return 0
+
+    with _database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO files (year, season, category, file_id, file_name)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT(year, season, category) DO UPDATE SET
+                    file_id = EXCLUDED.file_id,
+                    file_name = EXCLUDED.file_name
+                """,
+                rows,
+            )
+    logger.info("Migrated %d archive entries from SQLite to PostgreSQL", len(rows))
+    return len(rows)
 
 
 def fetch_years() -> list[str]:
-    connection = sqlite3.connect(DATABASE_PATH)
-    try:
-        return [
-            row[0]
-            for row in connection.execute(
+    with _database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
                 "SELECT DISTINCT year FROM files ORDER BY year DESC"
             )
-        ]
-    finally:
-        connection.close()
+            return [row[0] for row in cursor.fetchall()]
 
 
 def fetch_seasons(year: str) -> list[str]:
-    connection = sqlite3.connect(DATABASE_PATH)
-    try:
-        available = {
-            row[0]
-            for row in connection.execute(
-                "SELECT DISTINCT season FROM files WHERE year = ?", (year,)
+    with _database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT DISTINCT season FROM files WHERE year = %s", (year,)
             )
-        }
-        return [season for season in SEASONS if season in available]
-    finally:
-        connection.close()
+            available = {row[0] for row in cursor.fetchall()}
+    return [season for season in SEASONS if season in available]
 
 
 def fetch_categories(year: str, season: str) -> list[str]:
-    connection = sqlite3.connect(DATABASE_PATH)
-    try:
-        available = {
-            row[0]
-            for row in connection.execute(
-                "SELECT DISTINCT category FROM files WHERE year = ? AND season = ?",
+    with _database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT category FROM files
+                WHERE year = %s AND season = %s
+                """,
                 (year, season),
             )
-        }
-        return [category for category in CATEGORIES if category in available]
-    finally:
-        connection.close()
+            available = {row[0] for row in cursor.fetchall()}
+    return [category for category in CATEGORIES if category in available]
 
 
 def fetch_file(year: str, season: str, category: str) -> Optional[tuple[str, str]]:
-    connection = sqlite3.connect(DATABASE_PATH)
-    try:
-        return connection.execute(
-            """
-            SELECT file_id, file_name FROM files
-            WHERE year = ? AND season = ? AND category = ?
-            """,
-            (year, season, category),
-        ).fetchone()
-    finally:
-        connection.close()
+    with _database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT file_id, file_name FROM files
+                WHERE year = %s AND season = %s AND category = %s
+                """,
+                (year, season, category),
+            )
+            return cursor.fetchone()
 
 
 def save_file(
     year: str, season: str, category: str, file_id: str, file_name: str
 ) -> None:
-    connection = sqlite3.connect(DATABASE_PATH)
-    try:
-        connection.execute(
-            """
-            INSERT INTO files (year, season, category, file_id, file_name)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(year, season, category) DO UPDATE SET
-                file_id = excluded.file_id,
-                file_name = excluded.file_name
-            """,
-            (year, season, category, file_id, file_name),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    with _database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO files (year, season, category, file_id, file_name)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT(year, season, category) DO UPDATE SET
+                    file_id = EXCLUDED.file_id,
+                    file_name = EXCLUDED.file_name
+                """,
+                (year, season, category, file_id, file_name),
+            )
 
 
 def delete_file(year: str, season: str, category: str) -> bool:
-    connection = sqlite3.connect(DATABASE_PATH)
-    try:
-        cursor = connection.execute(
-            "DELETE FROM files WHERE year = ? AND season = ? AND category = ?",
-            (year, season, category),
-        )
-        connection.commit()
-        return cursor.rowcount > 0
-    finally:
-        connection.close()
+    with _database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM files WHERE year = %s AND season = %s AND category = %s",
+                (year, season, category),
+            )
+            return cursor.rowcount > 0
 
 
 def fetch_all_files() -> list[tuple[str, str, str, str]]:
-    connection = sqlite3.connect(DATABASE_PATH)
-    try:
-        return connection.execute(
-            """
-            SELECT year, season, category, file_name FROM files
-            ORDER BY year DESC, season, category
-            """
-        ).fetchall()
-    finally:
-        connection.close()
+    with _database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT year, season, category, file_name FROM files
+                ORDER BY year DESC, season, category
+                """
+            )
+            return cursor.fetchall()
 
 
 # Shared access and path validation.
@@ -244,7 +273,7 @@ async def handle_document(
     year, season, category = path
     try:
         save_file(year, season, category, document.file_id, file_name or "Excel file")
-    except sqlite3.Error:
+    except psycopg.Error:
         logger.exception("Could not save uploaded file metadata")
         await message.reply_text("The file could not be added because of a database error.")
         return
@@ -266,7 +295,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         years = fetch_years()
-    except sqlite3.Error:
+    except psycopg.Error:
         logger.exception("Could not load archive years")
         await message.reply_text("The archive could not be loaded due to a database error.")
         return
@@ -396,7 +425,7 @@ async def browse_callback(
             return
 
         await query.answer("Invalid selection.", show_alert=True)
-    except sqlite3.Error:
+    except psycopg.Error:
         logger.exception("Could not browse the archive")
         await query.answer("The archive is temporarily unavailable.", show_alert=True)
 
@@ -428,7 +457,7 @@ async def delete_command(
         return
     try:
         removed = delete_file(*path)
-    except sqlite3.Error:
+    except psycopg.Error:
         logger.exception("Could not delete archive entry")
         await message.reply_text("The file could not be deleted due to a database error.")
         return
@@ -453,7 +482,7 @@ async def list_command(
         return
     try:
         files = fetch_all_files()
-    except sqlite3.Error:
+    except psycopg.Error:
         logger.exception("Could not list archive entries")
         await message.reply_text("The archive could not be listed due to a database error.")
         return
@@ -498,7 +527,16 @@ def main() -> None:
     if not TOKEN:
         raise RuntimeError(
             "Telegram bot token is missing. Set TELEGRAM_BOT_TOKEN in the "
-            "same terminal before starting the bot."
+            "service environment before starting the bot."
+        )
+    if RENDER_EXTERNAL_URL and (
+        not WEBHOOK_SECRET
+        or len(WEBHOOK_SECRET) > 256
+        or re.fullmatch(r"[A-Za-z0-9_-]+", WEBHOOK_SECRET) is None
+    ):
+        raise RuntimeError(
+            "Set WEBHOOK_SECRET to 1-256 letters, numbers, underscores, or "
+            "hyphens when using RENDER_EXTERNAL_URL."
         )
     initialize_database()
     application = Application.builder().token(TOKEN).build()
@@ -508,9 +546,32 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(browse_callback))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Starting Excel archive bot")
-    application.run_polling()
+    if RENDER_EXTERNAL_URL:
+        try:
+            port = int(os.getenv("PORT", "10000"))
+        except ValueError as error:
+            raise RuntimeError("PORT must be a valid integer.") from error
+        if port < 1 or port > 65535:
+            raise RuntimeError("PORT must be between 1 and 65535.")
+        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_PATH}"
+        logger.info("Starting Excel archive bot webhook on port %d", port)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=WEBHOOK_PATH,
+            webhook_url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+        )
+    else:
+        logger.info("Starting Excel archive bot with polling")
+        application.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--migrate-sqlite"]:
+        migrated_count = migrate_sqlite_to_postgres()
+        print(f"Migrated {migrated_count} archive entries.")
+    elif len(sys.argv) > 1:
+        raise SystemExit("Usage: python bot.py [--migrate-sqlite]")
+    else:
+        main()
